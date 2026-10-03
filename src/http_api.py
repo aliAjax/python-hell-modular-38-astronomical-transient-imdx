@@ -84,6 +84,15 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "batches"]:
+                    return self._send(200, {"items": service.list_batches()})
+                if len(parts) == 3 and parts[:2] == ["api", "batches"]:
+                    return self._send(200, service.get_batch(parts[2]))
+                if parts == ["api", "windows"]:
+                    status = parse_qs(parsed.query).get("status", [None])[0]
+                    return self._send(200, {"items": service.list_windows(status=status)})
+                if len(parts) == 3 and parts[:2] == ["api", "windows"]:
+                    return self._send(200, service.get_window(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -138,6 +147,29 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if len(parts) == 2 and parts == ["api", "batches"]:
+                    body = self._body()
+                    batch, created = service.submit_result_batch(
+                        actor,
+                        body.get("batch_key"),
+                        body.get("source"),
+                        body.get("items"),
+                        body.get("expected_version"),
+                    )
+                    return self._send(201 if created else 200, {"batch": batch, "created": created})
+                if len(parts) == 4 and parts[:2] == ["api", "windows"] and parts[3] == "confirm":
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.confirm_window(
+                            actor,
+                            parts[2],
+                            body.get("decision"),
+                            body.get("expected_version"),
+                        ),
+                    )
+                if len(parts) == 2 and parts == ["api", "upgrade"]:
+                    return self._send(200, service.upgrade_pending_returns(actor))
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     return self._send(

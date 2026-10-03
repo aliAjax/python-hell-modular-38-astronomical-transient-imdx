@@ -34,6 +34,16 @@ python3 app.py --db ./data.db --port 8338
 
 身份通过`X-User-Id`和`X-Role`请求头传入。可选`Idempotency-Key`防止重复创建。
 
+## 回传对账（望远镜控制系统）
+
+窗口结束后回传结果批次，批次经`batch_key`幂等：重复投递只入账一次，已入账窗口保留，其余按原批次重试，不留半写状态。同一窗口支持本地回传（`local`）与归档复核（`archive`）两套来源：结论一致时有效窗口更新观测（成功标记完成，失败释放望远镜与观测队时段并生成补观测申请）；结论矛盾时保留双方结论、记录到达顺序、标记`pending_confirmation`，确认前不归档不重排。两人同时提交同一批次只让一份成功；越权或过期版本提交拒绝并留审计。
+
+- `POST /api/batches`：提交回传批次，`{batch_key, source, items:[{window_id, conclusion, payload}], expected_version?}`，重复投递返回`200`
+- `GET /api/batches`、`GET /api/batches/<batch_key>`：批次与条目状态
+- `GET /api/windows`、`GET /api/windows/<window_id>`：窗口对账状态（`pending_return`/`pending`/`confirmed`/`pending_confirmation`）
+- `POST /api/windows/<window_id>/confirm`：确认矛盾窗口，`{decision: "local"|"archive"|{conclusion, payload}}`
+- `POST /api/upgrade`：历史数据补`pending_return`状态（幂等，仅管理员）
+
 ## 测试
 
 ```bash

@@ -155,6 +155,14 @@ class RuleEngine:
         "telescopes": "telescope",
         "observations": "observation",
     }
+    # 回传来源：本地回传（实时）与归档复核（事后）
+    BATCH_SOURCES = ("local", "archive")
+    BATCH_ROLES = {
+        "local": ("operator", "coordinator", "admin"),
+        "archive": ("coordinator", "admin"),
+    }
+    CONFIRM_ROLES = ("coordinator", "supervisor", "admin")
+    UPGRADE_ROLES = ("admin",)
     INITIAL_STATUS = {
         "source": "registered",
         "candidate": "detected",
@@ -285,3 +293,30 @@ class RuleEngine:
         if extra:
             patch.update(extra)
         return next_status, patch
+
+    def validate_batch_submit(self, actor, source, items):
+        """Validate a telescope control result batch submission."""
+        if source not in self.BATCH_SOURCES:
+            raise ValidationError("source must be local or archive")
+        self._ensure_role(actor, self.BATCH_ROLES[source])
+        if not isinstance(items, list) or not items:
+            raise ValidationError("items must be a non-empty list")
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValidationError("each item must be an object")
+            if not str(item.get("window_id", "")).strip():
+                raise ValidationError("item window_id is required")
+            if item.get("conclusion") not in ("success", "failure"):
+                raise ValidationError("item conclusion must be success or failure")
+
+    def validate_confirm(self, actor, decision):
+        """Validate a human decision on a conflicted window."""
+        self._ensure_role(actor, self.CONFIRM_ROLES)
+        if decision in ("local", "archive"):
+            return
+        if isinstance(decision, dict) and decision.get("conclusion") in ("success", "failure"):
+            return
+        raise ValidationError("decision must be 'local', 'archive', or {conclusion: success|failure}")
+
+    def validate_upgrade(self, actor):
+        self._ensure_role(actor, self.UPGRADE_ROLES)
