@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from .domain import ConflictError, NotFoundError
@@ -7,6 +8,77 @@ from .domain import ConflictError, NotFoundError
 
 def utcnow():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class _Transaction:
+    """Read/write handle bound to one BEGIN IMMEDIATE transaction."""
+
+    def __init__(self, connection, now):
+        self._connection = connection
+        self.now = now
+
+    def _entity(self, row):
+        return SQLiteRepository._entity_from_row(row)
+
+    def get(self, entity_id):
+        row = self._connection.execute(
+            "SELECT * FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        return self._entity(row) if row else None
+
+    def list_kind(self, kind):
+        rows = self._connection.execute(
+            "SELECT * FROM entities WHERE kind = ? ORDER BY created_at, id", (kind,)
+        ).fetchall()
+        return [self._entity(row) for row in rows]
+
+    def insert(self, entity_id, kind, status, data, actor_id, version=1):
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        try:
+            self._connection.execute(
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (entity_id, kind, status, version, payload, actor_id, self.now, self.now),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("entity already exists: " + entity_id) from exc
+        entity = self.get(entity_id)
+        if entity is None:
+            raise NotFoundError("entity not found after insert: " + entity_id)
+        return entity
+
+    def update(self, entity, status, data):
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        current = self.get(entity["id"])
+        if current is None:
+            raise NotFoundError("entity not found: " + entity["id"])
+        if current["version"] != entity["version"]:
+            raise ConflictError(
+                "version conflict: expected %s, found %s"
+                % (entity["version"], current["version"])
+            )
+        self._connection.execute(
+            "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+            "WHERE id = ? AND version = ?",
+            (status, payload, self.now, entity["id"], entity["version"]),
+        )
+        return self.get(entity["id"])
+
+    def audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
+        self._connection.execute(
+            "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entity_id,
+                actor_id,
+                actor_role,
+                action,
+                from_status,
+                to_status,
+                json.dumps(detail or {}, ensure_ascii=False, sort_keys=True),
+                self.now,
+            ),
+        )
 
 
 class SQLiteRepository:
@@ -19,8 +91,22 @@ class SQLiteRepository:
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextmanager
+    def _auto_connection(self):
+        """Commit/rollback and always close the connection.
+
+        sqlite3's own context manager commits but never closes the connection,
+        which leaked write locks under load; this one closes it.
+        """
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def _initialize(self):
-        with self._connect() as connection:
+        with self._auto_connection() as connection:
             connection.executescript("""
                 CREATE TABLE IF NOT EXISTS entities (
                     id TEXT PRIMARY KEY,
@@ -54,7 +140,91 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS schema_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
             """)
+        self._migrate()
+
+    def _migrate(self):
+        """Bring databases created before result reconciliation up to date.
+
+        Historical scheduled observations have no return records on file, so
+        they must not be treated as if they already had results: they become
+        ``awaiting_result`` instead. Only a database created by an older
+        version is migrated; a fresh database starts at the current version.
+        """
+        with self._auto_connection() as connection:
+            row = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if row is not None:
+                return
+            existing = connection.execute("SELECT COUNT(*) AS n FROM entities").fetchone()
+            if existing["n"] == 0:
+                connection.execute(
+                    "INSERT INTO schema_meta(key, value) VALUES ('schema_version', '2')"
+                )
+                return
+            rows = connection.execute(
+                "SELECT id FROM entities WHERE kind = 'observation' AND status = 'scheduled'"
+            ).fetchall()
+            now = utcnow()
+            for observation_row in rows:
+                connection.execute(
+                    "UPDATE entities SET status = 'awaiting_result', updated_at = ? WHERE id = ?",
+                    (now, observation_row["id"]),
+                )
+                connection.execute(
+                    "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, "
+                    "from_status, to_status, detail, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        observation_row["id"],
+                        "system",
+                        "system",
+                        "migration_awaiting_result",
+                        "scheduled",
+                        "awaiting_result",
+                        json.dumps(
+                            {"reason": "historical window without returned results"},
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        now,
+                    ),
+                )
+            connection.execute(
+                "INSERT INTO schema_meta(key, value) VALUES ('schema_version', '2')"
+            )
+
+    def run_in_transaction(self, callback):
+        """Run callback with a single BEGIN IMMEDIATE transaction.
+
+        The callback receives a _Transaction handle. Any exception rolls the
+        whole transaction back, so a window can never be left half written.
+        A CommitAndRaise control-flow exception instead commits the audit rows
+        written inside and re-raises its carried cause.
+        """
+        from .domain import CommitAndRaise
+
+        connection = self._connect()
+        now = utcnow()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                result = callback(_Transaction(connection, now))
+            except CommitAndRaise as control:
+                connection.commit()
+                raise control.cause
+            connection.commit()
+            return result
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     @staticmethod
     def _entity_from_row(row):
@@ -72,16 +242,19 @@ class SQLiteRepository:
     def create_entity(self, entity_id, kind, status, data, actor_id):
         now = utcnow()
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
-                "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
-                (entity_id, kind, status, payload, actor_id, now, now),
-            )
+        try:
+            with self._auto_connection() as connection:
+                connection.execute(
+                    "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                    "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+                    (entity_id, kind, status, payload, actor_id, now, now),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("entity already exists: " + entity_id) from exc
         return self.get_entity(entity_id)
 
     def get_entity(self, entity_id):
-        with self._connect() as connection:
+        with self._auto_connection() as connection:
             row = connection.execute(
                 "SELECT * FROM entities WHERE id = ?", (entity_id,)
             ).fetchone()
@@ -97,7 +270,7 @@ class SQLiteRepository:
             clauses.append("status = ?")
             params.append(status)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        with self._connect() as connection:
+        with self._auto_connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM entities" + where + " ORDER BY created_at, id", params
             ).fetchall()
@@ -141,7 +314,7 @@ class SQLiteRepository:
         return self.get_entity(entity_id)
 
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
-        with self._connect() as connection:
+        with self._auto_connection() as connection:
             connection.execute(
                 "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -158,7 +331,7 @@ class SQLiteRepository:
             )
 
     def list_audit(self, entity_id=None):
-        with self._connect() as connection:
+        with self._auto_connection() as connection:
             if entity_id:
                 rows = connection.execute(
                     "SELECT * FROM audit_log WHERE entity_id = ? ORDER BY id", (entity_id,)
@@ -181,7 +354,7 @@ class SQLiteRepository:
         ]
 
     def get_idempotency(self, actor_id, idem_key):
-        with self._connect() as connection:
+        with self._auto_connection() as connection:
             row = connection.execute(
                 "SELECT entity_id FROM idempotency WHERE actor_id = ? AND idem_key = ?",
                 (actor_id, idem_key),
@@ -189,7 +362,7 @@ class SQLiteRepository:
         return row["entity_id"] if row else None
 
     def save_idempotency(self, actor_id, idem_key, entity_id):
-        with self._connect() as connection:
+        with self._auto_connection() as connection:
             connection.execute(
                 "INSERT OR REPLACE INTO idempotency(actor_id, idem_key, entity_id, created_at) "
                 "VALUES (?, ?, ?, ?)",
@@ -197,6 +370,6 @@ class SQLiteRepository:
             )
 
     def ping(self):
-        with self._connect() as connection:
+        with self._auto_connection() as connection:
             connection.execute("SELECT 1").fetchone()
         return True

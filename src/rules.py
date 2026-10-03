@@ -31,6 +31,12 @@ def measurements_overlap(first_start, first_end, second_start, second_end):
     return str(first_start) < str(second_end) and str(second_start) < str(first_end)
 
 
+# Statuses that still hold the telescope and the observing team's time slot.
+# Waiting for a returned batch and waiting for a disputed conclusion both keep
+# the slot; released windows give it back.
+SLOT_HOLDING_STATUSES = ("scheduled", "awaiting_result", "result_pending")
+
+
 def _validate_source(actor, data, lookup):
     if len(str(data.get("name", "")).strip()) < 2:
         raise ValidationError("source name is required")
@@ -125,7 +131,7 @@ def _validate_correct(actor, entity, data, lookup):
 def _validate_schedule(actor, entity, data, lookup):
     observations = lookup("observation", "telescope_id", entity["data"].get("telescope_id")) if lookup else []
     for other in observations:
-        if other["id"] == entity["id"] or other["status"] != "scheduled":
+        if other["id"] == entity["id"] or other["status"] not in SLOT_HOLDING_STATUSES:
             continue
         if measurements_overlap(
             entity["data"].get("start_at"),
@@ -136,7 +142,7 @@ def _validate_schedule(actor, entity, data, lookup):
             raise ConflictError("telescope is already scheduled in this window")
     team_observations = lookup("observation", "team_id", entity["data"].get("team_id")) if lookup else []
     for other in team_observations:
-        if other["id"] == entity["id"] or other["status"] != "scheduled":
+        if other["id"] == entity["id"] or other["status"] not in SLOT_HOLDING_STATUSES:
             continue
         if measurements_overlap(
             entity["data"].get("start_at"),
@@ -154,12 +160,17 @@ class RuleEngine:
         "candidates": "candidate",
         "telescopes": "telescope",
         "observations": "observation",
+        "result_batches": "result_batch",
+        "window_results": "window_result",
+        "makeup_observations": "observation",
     }
     INITIAL_STATUS = {
         "source": "registered",
         "candidate": "detected",
         "telescope": "available",
         "observation": "requested",
+        "result_batch": "ingested",
+        "window_result": "recorded",
     }
     TRANSITIONS = {
         "source": {
@@ -179,10 +190,10 @@ class RuleEngine:
             "restore": (("restricted",), "available"),
         },
         "observation": {
-            "schedule": (("requested",), "scheduled"),
-            "complete": (("scheduled",), "completed"),
-            "withdraw": (("requested", "scheduled"), "withdrawn"),
-            "correct": (("requested", "scheduled"), "requested"),
+            "schedule": (("requested",), "awaiting_result"),
+            "complete": (("scheduled", "awaiting_result"), "completed"),
+            "withdraw": (("requested", "scheduled", "awaiting_result"), "withdrawn"),
+            "correct": (("requested", "scheduled", "awaiting_result"), "requested"),
         },
     }
     CREATE_REQUIRED = {

@@ -138,6 +138,29 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if len(parts) == 2 and parts == ["api", "result-batches"]:
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.ingest_result_batch(
+                            actor,
+                            body,
+                            body.pop("expected_version", None),
+                        ),
+                    )
+                if (len(parts) == 4 and parts[0] == "api" and parts[1] == "entities"
+                        and parts[3] == "confirm-result"):
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.confirm_window_result(
+                            actor,
+                            parts[2],
+                            body.get("confirmed_conclusion"),
+                            body.get("reason"),
+                            body.get("expected_version"),
+                        ),
+                    )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     return self._send(

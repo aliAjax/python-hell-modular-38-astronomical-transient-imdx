@@ -27,6 +27,17 @@ class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 
 
+class CommitAndRaise(BaseException):
+    """Internal control flow: commit audit rows written in the transaction,
+    then raise ``cause`` to the caller. Used when a rejected submission must
+    leave an audit record without any other partial write. Inherits from
+    BaseException so generic ``except Exception`` rollback handlers skip it."""
+
+    def __init__(self, cause):
+        super().__init__(str(cause))
+        self.cause = cause
+
+
 class Role(str, Enum):
     viewer = "viewer"
     reporter = "reporter"

@@ -1,7 +1,8 @@
 from uuid import uuid4
 
 from .audit import AuditTrail
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, ValidationError
+from .reconciliation import ReconciliationService
 from .rules import RuleEngine
 
 
@@ -10,6 +11,7 @@ class DomainService:
         self.repository = repository
         self.rules = rules or RuleEngine()
         self.audit = AuditTrail(repository)
+        self.reconciliation = ReconciliationService(repository, self.rules)
 
     def _lookup(self, kind, field, value):
         return self.repository.find_entities(self.rules.normalize_kind(kind), field, value)
@@ -19,6 +21,10 @@ class DomainService:
 
     def create(self, actor, kind, data, idempotency_key=None):
         kind = self.rules.normalize_kind(kind)
+        if kind in ("result_batch", "window_result"):
+            raise ValidationError(
+                "result batches and window results are created via the result feed"
+            )
         payload = dict(data or {})
         if idempotency_key:
             existing = self.repository.get_idempotency(actor.user_id, idempotency_key)
@@ -73,3 +79,15 @@ class DomainService:
 
     def audit_log(self, entity_id=None):
         return self.repository.list_audit(entity_id=entity_id)
+
+    def ingest_result_batch(self, actor, payload, expected_version=None):
+        return self.reconciliation.ingest_result_batch(
+            actor, payload, expected_version=expected_version
+        )
+
+    def confirm_window_result(self, actor, window_id, confirmed_conclusion, reason,
+                              expected_version=None):
+        return self.reconciliation.resolve_window(
+            actor, window_id, confirmed_conclusion, reason,
+            expected_version=expected_version,
+        )
